@@ -39,7 +39,10 @@ SEASONAL_PEAKS = {
     "b2b":     [3, 6, 9, 12],
 }
 
-ORDER_EVENTS      = {"ORDER_RECEIVED", "ORDER_FULFILLED"}
+# ORDER_FULFILLED is handled separately in rolling_features: its inventory_after
+# field gives per-order inventory snapshots that are more granular than the
+# weekly LEDGER_ENTRY.  It is NOT counted toward the order tally — that is
+# covered by ORDER_RECEIVED alone to avoid double-counting.
 CANCELLATION_EVENTS = {"ORDER_CANCELLED"}
 BLOCKED_EVENTS    = {"FULFILLMENT_BLOCKED"}
 RESTOCK_EVENTS    = {"INVENTORY_RESTOCK", "SUPPLIER_PO_CREATED"}
@@ -88,7 +91,9 @@ def seasonality_features(dt, category):
     """Return dict of all seasonality-related features for a given datetime."""
     month_sin, month_cos         = sine_cosine_encode(dt.month, 12)
     dow_sin,   dow_cos           = sine_cosine_encode(dt.weekday(), 7)
-    wom_sin,   wom_cos           = sine_cosine_encode((dt.day - 1) // 7, 4)
+    # Clamp to week 3 so days 29–31 don't wrap back to week 0 in the cyclic
+    # encoding (day 29: (29-1)//7 = 4, which is 2π × 4/4 = 2π ≡ week 0).
+    wom_sin,   wom_cos           = sine_cosine_encode(min((dt.day - 1) // 7, 3), 4)
     peak_dist                    = days_to_nearest_peak(dt, category)
     peak_sin,  peak_cos          = sine_cosine_encode(peak_dist, 182)
 
@@ -121,12 +126,15 @@ def confidence_decay_weight(commit_dt, branch_dt, half_life_days=30):
 def rolling_features(commits_in_window, window_days, branch_dt, total_history_days):
     """
     Aggregate a list of commits into feature scalars for one lookback window.
-    All monetary values are normalised to % change to equalise across revenue scales.
+    Returns raw monetary values (revenue totals, cash balance, cash trend).
+    The caller (build_training_data) normalises these against the per-business
+    90-day baseline before writing to the training CSV, so that raw revenue
+    scale differences across categories (retail ~$200/day, B2B ~$40 k/day)
+    do not dominate the feature space.
     """
     if not commits_in_window:
         return {
             f"w{window_days}_order_count":          0,
-            f"w{window_days}_order_velocity":        0.0,
             f"w{window_days}_revenue_total":         0.0,
             f"w{window_days}_revenue_per_day":       0.0,
             f"w{window_days}_cancel_rate":           0.0,
@@ -162,6 +170,13 @@ def rolling_features(commits_in_window, window_days, branch_dt, total_history_da
             revenue_total += float(payload.get("revenue", 0))
             weighted_order_sum += w
 
+        elif et == "ORDER_FULFILLED":
+            # Capture per-order inventory snapshots — more granular than the
+            # weekly LEDGER_ENTRY, improving inv_trend signal quality.
+            inv = float(payload.get("inventory_after", -1))
+            if inv >= 0:
+                inventory_levels.append((dt, inv))
+
         elif et == "ORDER_CANCELLED":
             cancels += 1
 
@@ -182,8 +197,13 @@ def rolling_features(commits_in_window, window_days, branch_dt, total_history_da
             inventory_levels.append((dt, inv))
 
     # Derived scalars
-    order_velocity    = orders / window_days
-    cancel_rate       = cancels / max(orders, 1)
+    # order_velocity (= order_count / window_days) is dropped: it is an exact
+    # linear function of order_count and window_days, adding no information but
+    # creating near-perfect collinearity that inflates Ridge coefficients.
+    # Cap at 1.0: ORDER_CANCELLED events from prior periods can fall inside the
+    # current window while their originating ORDER_RECEIVED is outside it,
+    # making the raw ratio exceed 1.0 and become semantically meaningless.
+    cancel_rate       = min(cancels / max(orders, 1), 1.0)
     blocked_rate      = blocked / max(orders + blocked, 1)
     revenue_per_day   = revenue_total / window_days
     avg_price_change  = sum(price_changes) / len(price_changes) if price_changes else 0.0
@@ -206,7 +226,6 @@ def rolling_features(commits_in_window, window_days, branch_dt, total_history_da
 
     return {
         f"w{window_days}_order_count":          orders,
-        f"w{window_days}_order_velocity":        round(order_velocity, 4),
         f"w{window_days}_revenue_total":         round(revenue_total, 2),
         f"w{window_days}_revenue_per_day":       round(revenue_per_day, 4),
         f"w{window_days}_cancel_rate":           round(cancel_rate, 4),
@@ -225,7 +244,14 @@ def rolling_features(commits_in_window, window_days, branch_dt, total_history_da
 def scenario_delta_features(branch, business_commits, branch_dt):
     """
     How far does this scenario deviate from the business's historical baseline?
-    Compares branch_params to recent historical averages.
+
+    Returns type-specific magnitude features (exactly one non-zero per row)
+    instead of a single polymorphic scenario_magnitude column.  The old design
+    conflated incompatible units across branch types — bulk_restock quantity
+    (100–500) vs contract_change value after /10 000 normalisation (0.05–1.0)
+    — so a linear model could not fit a meaningful single coefficient.  Each
+    new column covers one semantic group and is normalised to a consistent
+    range within that group.
     """
     try:
         params = json.loads(branch["branch_params"]) if branch["branch_params"] else {}
@@ -249,19 +275,29 @@ def scenario_delta_features(branch, business_commits, branch_dt):
         if past_price_changes else 0.0
     )
 
-    # Scenario-specific deviation
-    scenario_magnitude  = 0.0
-    deviation_from_norm = 0.0
+    # ── Type-specific magnitude features ──────────────────────────────────────
+    # Exactly one of these will be non-zero per row, keyed by branch_type group.
+    # Ranges are noted so StandardScaler and Ridge coefficients stay comparable.
+    mag_price_change_pct  = 0.0   # price_increase / price_decrease  → 5–25 (%)
+    mag_restock_qty_norm  = 0.0   # bulk_restock qty / 500            → 0.0–1.0
+    mag_restock_cost_norm = 0.0   # bulk_restock total cost / 40 000  → 0.0–1.0
+    mag_discount_pct      = 0.0   # promo_event / markdown / vol_disc → 10–50 (%)
+    mag_contract_norm     = 0.0   # contract_value / 100 000          → 0.05–1.0
+    mag_new_skus          = 0.0   # new_collection: raw SKU count      → 5–30
+    mag_terms_delta_days  = 0.0   # net_terms_change: abs days vs NET30 → 0–30
+    mag_supplier_cost_pct = 0.0   # supplier_change: abs cost change % → 0–15
+    deviation_from_norm   = 0.0
 
     if branch_type in ("price_increase", "price_decrease"):
         pct = float(params.get("pct_change", 0))
-        scenario_magnitude  = abs(pct)
-        deviation_from_norm = pct - hist_avg_price_change
+        mag_price_change_pct = abs(pct)
+        deviation_from_norm  = pct - hist_avg_price_change
 
     elif branch_type == "bulk_restock":
-        qty = float(params.get("quantity", 0))
-        scenario_magnitude = qty
-        # Compare to average restock quantity in history
+        qty           = float(params.get("quantity", 0))
+        cost_per_unit = float(params.get("cost_per_unit", 0))
+        mag_restock_qty_norm  = qty / 500.0                          # max qty = 500 → [0, 1]
+        mag_restock_cost_norm = (qty * cost_per_unit) / 40_000.0    # max cost ≈ 500×80 → [0, 1]
         past_restocks = []
         for c in business_commits:
             if c["event_type"] == "INVENTORY_RESTOCK" and parse_dt(c["timestamp"]) < branch_dt:
@@ -274,35 +310,37 @@ def scenario_delta_features(branch, business_commits, branch_dt):
         deviation_from_norm = (qty - avg_restock) / max(avg_restock, 1)
 
     elif branch_type == "promo_event":
-        scenario_magnitude  = float(params.get("discount_pct", 0))
-        deviation_from_norm = scenario_magnitude  # no baseline for promos
+        mag_discount_pct    = float(params.get("discount_pct", 0))
+        deviation_from_norm = mag_discount_pct   # no historical baseline for promos
 
     elif branch_type == "markdown":
-        scenario_magnitude  = float(params.get("markdown_pct", 0))
-        deviation_from_norm = scenario_magnitude
+        mag_discount_pct    = float(params.get("markdown_pct", 0))
+        deviation_from_norm = mag_discount_pct
 
     elif branch_type == "volume_discount":
-        scenario_magnitude  = float(params.get("discount_pct", 0))
-        deviation_from_norm = scenario_magnitude
+        mag_discount_pct    = float(params.get("discount_pct", 0))
+        deviation_from_norm = mag_discount_pct
 
     elif branch_type == "contract_change":
-        scenario_magnitude  = float(params.get("contract_value", 0)) / 10_000  # normalise
-        deviation_from_norm = scenario_magnitude
+        contract_value    = float(params.get("contract_value", 0))
+        mag_contract_norm = contract_value / 100_000.0  # 5 k–100 k → 0.05–1.0
+        deviation_from_norm = mag_contract_norm
 
     elif branch_type == "new_collection":
-        scenario_magnitude  = float(params.get("new_skus", 0))
-        deviation_from_norm = scenario_magnitude
+        mag_new_skus        = float(params.get("new_skus", 0))
+        deviation_from_norm = mag_new_skus
 
     elif branch_type == "supplier_change":
-        scenario_magnitude  = abs(float(params.get("cost_change_pct", 0)))
-        deviation_from_norm = float(params.get("cost_change_pct", 0))
+        cost_pct              = float(params.get("cost_change_pct", 0))
+        mag_supplier_cost_pct = abs(cost_pct)
+        deviation_from_norm   = cost_pct   # keep signed — direction matters
 
     elif branch_type == "net_terms_change":
         new_terms = params.get("new_terms", "NET30")
         terms_map = {"NET15": -15, "NET30": 0, "NET45": 15, "NET60": 30}
-        delta = terms_map.get(new_terms, 0) - terms_map.get("NET30", 0)
-        scenario_magnitude  = abs(delta)
-        deviation_from_norm = delta
+        delta                = terms_map.get(new_terms, 0) - terms_map.get("NET30", 0)
+        mag_terms_delta_days = abs(delta)
+        deviation_from_norm  = delta
 
     history_depth_days = max(
         [(branch_dt - parse_dt(c["timestamp"])).days for c in business_commits]
@@ -310,11 +348,18 @@ def scenario_delta_features(branch, business_commits, branch_dt):
     )
 
     return {
-        "scenario_magnitude":      round(scenario_magnitude, 4),
-        "deviation_from_norm":     round(deviation_from_norm, 4),
-        "history_depth_days":      history_depth_days,
-        "n_past_price_changes":    len(past_price_changes),
-        "hist_avg_price_change":   round(hist_avg_price_change, 4),
+        "mag_price_change_pct":   round(mag_price_change_pct, 4),
+        "mag_restock_qty_norm":   round(mag_restock_qty_norm, 4),
+        "mag_restock_cost_norm":  round(mag_restock_cost_norm, 4),
+        "mag_discount_pct":       round(mag_discount_pct, 4),
+        "mag_contract_norm":      round(mag_contract_norm, 4),
+        "mag_new_skus":           round(mag_new_skus, 4),
+        "mag_terms_delta_days":   round(mag_terms_delta_days, 4),
+        "mag_supplier_cost_pct":  round(mag_supplier_cost_pct, 4),
+        "deviation_from_norm":    round(deviation_from_norm, 4),
+        "history_depth_days":     history_depth_days,
+        "n_past_price_changes":   len(past_price_changes),
+        "hist_avg_price_change":  round(hist_avg_price_change, 4),
     }
 
 # ── CATEGORY ONE-HOT ENCODING ─────────────────────────────────────────────────
@@ -328,6 +373,14 @@ def category_features(category):
 
 # ── BRANCH TYPE ONE-HOT ENCODING ──────────────────────────────────────────────
 
+# Note: some branch types are exclusive to one category (e.g. new_collection and
+# markdown are apparel-only; contract_change / net_terms_change / volume_discount
+# are b2b-only; supplier_change is retail-only).  The full list is kept here so
+# every row carries the same fixed-width one-hot schema.  For any given category
+# ~30–40 % of bt_* columns will always be zero, creating near-perfect collinearity
+# with the cat_* columns.  Ridge handles this via L2 shrinkage without breaking.
+# If a tree-based model (XGBoost) is used later, these dead columns can be dropped
+# safely by conditioning on cat_* at feature-selection time.
 ALL_BRANCH_TYPES = [
     "price_increase", "price_decrease", "bulk_restock", "promo_event",
     "new_collection", "markdown", "contract_change", "net_terms_change",
@@ -394,16 +447,42 @@ def build_training_data():
         total_history = (branch_dt - parse_dt(prior_commits[0]["timestamp"])).days
 
         # ── Rolling window features for each lookback window
-        window_feats = {}
+        # Compute all three windows first, then normalise monetary features
+        # (revenue, cash) against the per-business 90-day baseline.  This
+        # converts absolute dollar values into ratios that are comparable
+        # across categories whose revenue scales differ by up to 40×.
+        raw_window_feats = {}
         for window in LOOKBACK_WINDOWS:
             cutoff = branch_dt - timedelta(days=window)
             window_commits = [
                 c for c in prior_commits
                 if parse_dt(c["timestamp"]) >= cutoff
             ]
-            window_feats.update(
-                rolling_features(window_commits, window, branch_dt, total_history)
+            raw_window_feats[window] = rolling_features(
+                window_commits, window, branch_dt, total_history
             )
+
+        # 90-day values serve as the per-business normalisation baseline.
+        # Fall back to 1.0 so division is safe when history is sparse.
+        rev_baseline  = raw_window_feats[90]["w90_revenue_per_day"]    or 1.0
+        cash_baseline = raw_window_feats[90]["w90_latest_cash_balance"] or 1.0
+
+        window_feats = {}
+        for window in LOOKBACK_WINDOWS:
+            wf = raw_window_feats[window].copy()
+            # Revenue features → ratio vs 90-day revenue-per-day baseline
+            if rev_baseline > 0:
+                wf[f"w{window}_revenue_total"]   = round(
+                    wf[f"w{window}_revenue_total"] / (rev_baseline * window), 6)
+                wf[f"w{window}_revenue_per_day"] = round(
+                    wf[f"w{window}_revenue_per_day"] / rev_baseline, 6)
+            # Cash features → ratio vs 90-day cash balance baseline
+            if cash_baseline > 0:
+                wf[f"w{window}_latest_cash_balance"] = round(
+                    wf[f"w{window}_latest_cash_balance"] / cash_baseline, 6)
+                wf[f"w{window}_cash_trend"] = round(
+                    wf[f"w{window}_cash_trend"] / cash_baseline, 6)
+            window_feats.update(wf)
 
         # ── Seasonality features
         season_feats = seasonality_features(branch_dt, category)
@@ -457,7 +536,7 @@ def build_training_data():
     print(f"\nOutput: {OUTPUT_PATH}")
     print(f"  {len(fieldnames)} features per row")
     print(f"\nFeature groups:")
-    print(f"  Rolling windows (7/30/90d) : {len(LOOKBACK_WINDOWS) * 13} features")
+    print(f"  Rolling windows (7/30/90d) : {len(LOOKBACK_WINDOWS) * 12} features")
     print(f"  Seasonality               : {len(seasonality_features(datetime.now(), 'retail'))} features")
     dummy_branch = {"branch_params": "{}", "branch_type": "price_increase"}
     print(f"  Scenario delta            : {len(scenario_delta_features(dummy_branch, [], datetime.now()))} features")

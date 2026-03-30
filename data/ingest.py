@@ -118,6 +118,10 @@ def generate_commits(businesses):
         current_date = START_DATE
         restock_counter      = 0
         price_change_counter = 0
+        # Running cash balance — starts at ~10–30 days of revenue as opening
+        # capital.  Updated by actual revenues and costs so that the LEDGER_ENTRY
+        # snapshot reflects real business economics rather than the day index.
+        cash = round(revenue_base * random.uniform(10, 30), 2)
 
         for day in range(DAYS_OF_HISTORY):
             current_date = START_DATE + timedelta(days=day)
@@ -131,6 +135,7 @@ def generate_commits(businesses):
                 revenue = round(qty * price * jitter(1.0, 0.05), 2)
                 if inventory >= qty:
                     inventory -= qty
+                    cash += revenue   # revenue received on order
                     commits.append({
                         "commit_id":         uid(),
                         "timestamp":         (current_date + timedelta(
@@ -164,6 +169,7 @@ def generate_commits(businesses):
                     # Occasional cancellation
                     if random.random() < profile["return_rate"]:
                         inventory += qty
+                        cash -= revenue   # reverse revenue on cancellation
                         commits.append({
                             "commit_id":         uid(),
                             "timestamp":         (current_date + timedelta(
@@ -201,6 +207,7 @@ def generate_commits(businesses):
                 restock_qty = random.randint(50, 300)
                 inventory += restock_qty
                 cost = round(restock_qty * price * random.uniform(0.4, 0.65), 2)
+                cash -= cost   # cash outflow on restock
                 commits.append({
                     "commit_id":         uid(),
                     "timestamp":         current_date.isoformat(),
@@ -248,8 +255,12 @@ def generate_commits(businesses):
                 })
 
             # ── Ledger entry (cash position snapshot, weekly)
+            # Use the running cash balance (not a day-index formula) so that
+            # this feature reflects real business economics rather than encoding
+            # the passage of calendar time, which would cause distribution shift
+            # between the training and test windows.
             if day % 7 == 0:
-                cash_balance = round(revenue_base * s_mult * jitter(1.0, 0.2) * day, 2)
+                cash_balance = round(jitter(max(cash, 0), 0.03), 2)  # ±3% measurement noise
                 commits.append({
                     "commit_id":         uid(),
                     "timestamp":         current_date.isoformat(),
@@ -410,10 +421,13 @@ def generate_branches_and_outcomes(businesses, commits):
                 vel_delta  = round(random.uniform(-5, 5), 2)
                 inv_delta  = round(random.uniform(-10, 20), 2)
 
-            # Add noise to all deltas
-            inv_delta  = round(jitter(inv_delta  if inv_delta  != 0 else 1, 0.2), 2)
-            cash_delta = round(jitter(cash_delta if cash_delta != 0 else 1, 0.2), 2)
-            vel_delta  = round(jitter(vel_delta  if vel_delta  != 0 else 1, 0.2), 2)
+            # Add proportional noise to non-zero deltas only.
+            # Previously used jitter(0 → 1, 0.2) as a sentinel, which produced
+            # spurious ~±0.2 values for scenarios with genuinely zero impact
+            # (e.g. contract_change has inv_delta = 0 by design).
+            inv_delta  = round(jitter(inv_delta,  0.2) if inv_delta  != 0 else 0.0, 2)
+            cash_delta = round(jitter(cash_delta, 0.2) if cash_delta != 0 else 0.0, 2)
+            vel_delta  = round(jitter(vel_delta,  0.2) if vel_delta  != 0 else 0.0, 2)
 
             outcome_date = committed_at + timedelta(days=OUTCOME_HORIZON)
             outcomes.append({
