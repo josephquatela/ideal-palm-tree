@@ -169,10 +169,15 @@ def train_baseline(train: pd.DataFrame, test: pd.DataFrame) -> dict:
         # Residual std from training set — used to build prediction intervals
         train_resid_std = float(np.std(y_train - pipe.predict(X_train)))
 
+        y_lower = y_pred - CONFIDENCE_Z * train_resid_std
+        y_upper = y_pred + CONFIDENCE_Z * train_resid_std
+
         results[target] = {
             "model":          pipe,
             "y_test":         y_test.values,
             "y_pred":         y_pred,
+            "y_lower":        y_lower,
+            "y_upper":        y_upper,
             "resid_std":      train_resid_std,
             "mape":           mape(y_test.values, y_pred),
             "calibration":    calibration_score(y_test.values, y_pred, train_resid_std),
